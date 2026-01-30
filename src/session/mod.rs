@@ -4,7 +4,7 @@ pub mod types;
 
 use crate::fstar::{FStarConfig, FStarProcess, FullBufferResult, IdeProofState, ProcessError};
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -12,6 +12,9 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub use types::*;
+
+/// Default sweep period in seconds for cleaning up marked sessions
+pub const DEFAULT_SWEEP_PERIOD_SECS: u64 = 300;
 
 #[derive(Error, Debug)]
 pub enum SessionError {
@@ -32,6 +35,10 @@ pub struct Session {
     pub last_activity: DateTime<Utc>,
     /// Proof states collected from the last typecheck (from tactics)
     pub proof_states: Vec<IdeProofState>,
+    /// The MCP client session that owns this F* session
+    pub mcp_session_id: Option<String>,
+    /// Whether this session is marked for deletion (will be cleaned up by sweeper)
+    pub marked_for_deletion: bool,
 }
 
 impl Session {
@@ -52,6 +59,8 @@ impl Session {
             created_at: now,
             last_activity: now,
             proof_states: Vec::new(),
+            mcp_session_id: None,
+            marked_for_deletion: false,
         })
     }
 
@@ -100,6 +109,9 @@ pub struct SessionInfo {
     pub created_at: String,
     pub last_activity: String,
     pub idle_seconds: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_session_id: Option<String>,
+    pub marked_for_deletion: bool,
 }
 
 /// Manages multiple F* sessions
@@ -107,6 +119,8 @@ pub struct SessionManager {
     pub sessions: Arc<RwLock<HashMap<String, Session>>>,
     /// Maps file paths to session IDs for auto-replacement
     file_to_session: Arc<RwLock<HashMap<PathBuf, String>>>,
+    /// Maps MCP session IDs to F* session IDs they own
+    mcp_to_fstar_sessions: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
 impl Default for SessionManager {
@@ -120,6 +134,7 @@ impl SessionManager {
         SessionManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             file_to_session: Arc::new(RwLock::new(HashMap::new())),
+            mcp_to_fstar_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -128,6 +143,16 @@ impl SessionManager {
         &self,
         file_path: &Path,
         config: FStarConfig,
+    ) -> Result<String, SessionError> {
+        self.create_session_with_mcp(file_path, config, None).await
+    }
+
+    /// Create a new session with MCP session tracking
+    pub async fn create_session_with_mcp(
+        &self,
+        file_path: &Path,
+        config: FStarConfig,
+        mcp_session_id: Option<String>,
     ) -> Result<String, SessionError> {
         // Check for existing session for this file
         let existing_session_id = {
@@ -141,7 +166,8 @@ impl SessionManager {
         }
 
         // Create new session
-        let session = Session::new(file_path, config, false).await?;
+        let mut session = Session::new(file_path, config, false).await?;
+        session.mcp_session_id = mcp_session_id.clone();
         let session_id = session.id.clone();
         let file_path_owned = file_path.to_path_buf();
 
@@ -157,24 +183,87 @@ impl SessionManager {
             file_map.insert(file_path_owned, session_id.clone());
         }
 
+        // Track MCP session ownership
+        if let Some(mcp_id) = mcp_session_id {
+            let mut mcp_map = self.mcp_to_fstar_sessions.write().await;
+            mcp_map
+                .entry(mcp_id)
+                .or_insert_with(HashSet::new)
+                .insert(session_id.clone());
+        }
+
         Ok(session_id)
     }
 
-    /// List all active sessions
+    /// List all active sessions (excludes sessions marked for deletion)
     pub async fn list_sessions(&self) -> Vec<SessionInfo> {
         let sessions = self.sessions.read().await;
         let now = Utc::now();
         
-        sessions.values().map(|s| {
-            let idle_seconds = (now - s.last_activity).num_seconds();
-            SessionInfo {
-                session_id: s.id.clone(),
-                file_path: s.file_path.to_string_lossy().to_string(),
-                created_at: s.created_at.to_rfc3339(),
-                last_activity: s.last_activity.to_rfc3339(),
-                idle_seconds,
+        sessions.values()
+            .filter(|s| !s.marked_for_deletion)
+            .map(|s| {
+                let idle_seconds = (now - s.last_activity).num_seconds();
+                SessionInfo {
+                    session_id: s.id.clone(),
+                    file_path: s.file_path.to_string_lossy().to_string(),
+                    created_at: s.created_at.to_rfc3339(),
+                    last_activity: s.last_activity.to_rfc3339(),
+                    idle_seconds,
+                    mcp_session_id: s.mcp_session_id.clone(),
+                    marked_for_deletion: s.marked_for_deletion,
+                }
+            }).collect()
+    }
+
+    /// Mark all sessions belonging to an MCP session for deletion
+    pub async fn mark_sessions_for_deletion(&self, mcp_session_id: &str) {
+        // Get F* session IDs owned by this MCP session
+        let fstar_session_ids = {
+            let mcp_map = self.mcp_to_fstar_sessions.read().await;
+            mcp_map.get(mcp_session_id).cloned().unwrap_or_default()
+        };
+
+        if fstar_session_ids.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            mcp_session = %mcp_session_id,
+            session_count = fstar_session_ids.len(),
+            "Marking F* sessions for deletion"
+        );
+
+        // Mark each session
+        let mut sessions = self.sessions.write().await;
+        for session_id in &fstar_session_ids {
+            if let Some(session) = sessions.get_mut(session_id) {
+                session.marked_for_deletion = true;
             }
-        }).collect()
+        }
+    }
+
+    /// Sweep and delete all sessions marked for deletion
+    pub async fn sweep_marked_sessions(&self) -> usize {
+        let sessions_to_delete: Vec<String> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .values()
+                .filter(|s| s.marked_for_deletion)
+                .map(|s| s.id.clone())
+                .collect()
+        };
+
+        let count = sessions_to_delete.len();
+        if count > 0 {
+            tracing::info!(count = count, "Sweeping marked sessions");
+        }
+
+        for session_id in sessions_to_delete {
+            self.close_session(&session_id).await.ok();
+        }
+
+        count
     }
 
     /// Close a session
@@ -191,17 +280,22 @@ impl SessionManager {
                 file_map.remove(&session.file_path);
             }
 
+            // Remove from MCP session mapping
+            if let Some(mcp_id) = &session.mcp_session_id {
+                let mut mcp_map = self.mcp_to_fstar_sessions.write().await;
+                if let Some(fstar_ids) = mcp_map.get_mut(mcp_id) {
+                    fstar_ids.remove(session_id);
+                    if fstar_ids.is_empty() {
+                        mcp_map.remove(mcp_id);
+                    }
+                }
+            }
+
             // Kill the process
             session.process.kill().await.ok();
             Ok(())
         } else {
             Err(SessionError::NotFound(session_id.to_string()))
         }
-    }
-}
-
-impl Drop for SessionManager {
-    fn drop(&mut self) {
-        // Sessions will be cleaned up when dropped
     }
 }

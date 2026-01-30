@@ -2,4 +2,4 @@
 
 pub mod tools;
 
-pub use tools::create_fstar_server;
+pub use tools::{create_fstar_server, SESSION_MANAGER};

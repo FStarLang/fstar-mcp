@@ -90,9 +90,6 @@ pub enum IdeLookupResponse {
     Module(IdeModule),
 }
 
-/// Autocomplete option: [match_length, annotation, candidate]
-pub type IdeAutoCompleteOption = (u32, String, String);
-
 /// Proof state from tactics
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct IdeProofState {

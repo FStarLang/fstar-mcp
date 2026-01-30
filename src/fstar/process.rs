@@ -409,34 +409,6 @@ impl FStarProcess {
         Err(ProcessError::ProcessExited(None))
     }
 
-    /// Send an autocomplete query
-    pub async fn autocomplete(&mut self, partial_symbol: &str) -> Result<Vec<IdeAutoCompleteOption>, ProcessError> {
-        let query = serde_json::json!({
-            "query": "autocomplete",
-            "args": {
-                "partial-symbol": partial_symbol,
-                "context": "code"
-            }
-        });
-
-        let qid = self.send_query(query).await?;
-
-        while let Some(response) = self.response_rx.recv().await {
-            if let FStarResponse::Response(resp) = response {
-                if resp.query_id == qid {
-                    if resp.status == Some("success".to_string()) {
-                        if let Some(r) = resp.response {
-                            return Ok(serde_json::from_value(r).unwrap_or_default());
-                        }
-                    }
-                    return Ok(vec![]);
-                }
-            }
-        }
-
-        Err(ProcessError::ProcessExited(None))
-    }
-
     /// Send restart-solver request
     pub async fn restart_solver(&mut self) -> Result<(), ProcessError> {
         let query = serde_json::json!({

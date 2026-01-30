@@ -127,19 +127,6 @@ impl From<&FStarRange> for RangeInfo {
     }
 }
 
-/// Response from autocomplete tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutocompleteResponse {
-    pub completions: Vec<CompletionInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompletionInfo {
-    pub match_length: u32,
-    pub annotation: String,
-    pub candidate: String,
-}
-
 /// Response from restart_solver tool
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestartSolverResponse {

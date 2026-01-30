@@ -788,3 +788,55 @@ mod get_proof_context_tests {
         assert_eq!(goals[2]["goal"]["type"], "goal3: unit");
     }
 }
+
+// ============================================================================
+// Tests for session cleanup (mark for deletion and sweep)
+// ============================================================================
+
+#[cfg(test)]
+mod session_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn test_mark_sessions_for_deletion() {
+        let manager = MockSessionManager::new();
+        
+        // Create sessions
+        let config1 = MockFStarConfig::new().with_successful_typecheck();
+        let config2 = MockFStarConfig::new().with_successful_typecheck();
+        let session1 = manager.create_session("/path/to/File1.fst", config1);
+        let session2 = manager.create_session("/path/to/File2.fst", config2);
+        
+        assert_eq!(manager.session_count(), 2);
+        
+        // Sessions should exist
+        assert!(manager.get_session(&session1).is_some());
+        assert!(manager.get_session(&session2).is_some());
+        
+        // Close one session
+        manager.close_session(&session1);
+        assert_eq!(manager.session_count(), 1);
+        assert!(manager.get_session(&session1).is_none());
+        assert!(manager.get_session(&session2).is_some());
+    }
+
+    #[test]
+    fn test_session_auto_replacement() {
+        let manager = MockSessionManager::new();
+        
+        // Create session for a file
+        let config1 = MockFStarConfig::new().with_successful_typecheck();
+        let session1 = manager.create_session("/path/to/Test.fst", config1);
+        assert_eq!(manager.session_count(), 1);
+        
+        // Create another session for the same file - should replace
+        let config2 = MockFStarConfig::new().with_successful_typecheck();
+        let session2 = manager.create_session("/path/to/Test.fst", config2);
+        assert_eq!(manager.session_count(), 1);
+        
+        // Old session should be gone
+        assert!(manager.get_session(&session1).is_none());
+        // New session should exist
+        assert!(manager.get_session(&session2).is_some());
+    }
+}

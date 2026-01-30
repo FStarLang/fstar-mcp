@@ -2,7 +2,7 @@
 
 use crate::fstar::{FStarConfig, IdeLookupResponse};
 use crate::session::{
-    AutocompleteResponse, CloseSessionResponse, CompletionInfo, CreateFStarResponse,
+    CloseSessionResponse, CreateFStarResponse,
     DiagnosticInfo, FragmentInfo, LookupResponse, RangeInfo, RestartSolverResponse,
     SessionManager, TypecheckResponse, UpdateBufferResponse,
 };
@@ -17,37 +17,66 @@ use std::sync::Arc;
 
 // Shared session manager for all tools
 lazy_static::lazy_static! {
-    static ref SESSION_MANAGER: Arc<SessionManager> = Arc::new(SessionManager::new());
+    pub static ref SESSION_MANAGER: Arc<SessionManager> = Arc::new(SessionManager::new());
 }
 
 // ============================================================================
-// Tool: create_fstar
+// Tool: create_session
 // ============================================================================
 
-pub struct CreateFStarTool;
+pub struct CreateSessionTool;
 
 #[derive(Debug, Deserialize)]
-struct CreateFStarArgs {
-    file_path: String,
-    config_path: String,
+struct CreateSessionArgs {
+    /// Path to the F* file (optional - creates temp file if not provided)
+    file_path: Option<String>,
+    /// Path to fstar.exe (optional - defaults to "fstar.exe" in PATH)
+    fstar_exe: Option<String>,
+    /// Working directory (optional - defaults to file's directory)
+    cwd: Option<String>,
+    /// Include directories (--include paths)
+    include_dirs: Option<Vec<String>>,
+    /// F* command-line options
+    options: Option<Vec<String>>,
 }
 
 #[async_trait]
-impl ToolHandler for CreateFStarTool {
-    async fn handle(&self, args: Value, _extra: pmcp::RequestHandlerExtra) -> pmcp::Result<Value> {
-        let params: CreateFStarArgs = serde_json::from_value(args)
+impl ToolHandler for CreateSessionTool {
+    async fn handle(&self, args: Value, extra: pmcp::RequestHandlerExtra) -> pmcp::Result<Value> {
+        let params: CreateSessionArgs = serde_json::from_value(args)
             .map_err(|e| pmcp::Error::validation(format!("Invalid arguments: {}", e)))?;
 
-        let file_path = PathBuf::from(&params.file_path);
-        let config_path = PathBuf::from(&params.config_path);
+        // Get MCP session ID from request context
+        let mcp_session_id = extra.session_id.clone();
 
-        // Load configuration
-        let config = FStarConfig::from_file_with_env(&config_path)
-            .map_err(|e| pmcp::Error::validation(format!("Failed to load config: {}", e)))?;
+        // If no file path, create a temporary .fst file
+        let (file_path, created_file) = if let Some(fp) = params.file_path {
+            (PathBuf::from(fp), false)
+        } else {
+            let temp_dir = std::env::temp_dir();
+            let filename = format!("fstar_session_{}.fst", uuid::Uuid::new_v4());
+            let path = temp_dir.join(&filename);
+            // Create empty F* file with module declaration
+            let module_name = filename.replace(".fst", "").replace("-", "_");
+            tokio::fs::write(&path, format!("module {}\n", module_name))
+                .await
+                .map_err(|e| pmcp::Error::Internal(format!("Failed to create temp file: {}", e)))?;
+            (path, true)
+        };
 
-        // Create session
+        // Build config from arguments with sensible defaults
+        let config = FStarConfig {
+            fstar_exe: params.fstar_exe,
+            cwd: params.cwd.or_else(|| {
+                file_path.parent().map(|p| p.to_string_lossy().to_string())
+            }),
+            include_dirs: params.include_dirs.unwrap_or_default(),
+            options: params.options.unwrap_or_default(),
+        };
+
+        // Create session with MCP session tracking
         let session_id = SESSION_MANAGER
-            .create_session(&file_path, config)
+            .create_session_with_mcp(&file_path, config, mcp_session_id)
             .await
             .map_err(|e| pmcp::Error::Internal(format!("Failed to create session: {}", e)))?;
 
@@ -78,7 +107,7 @@ impl ToolHandler for CreateFStarTool {
             Ok(fb_result) => {
                 let has_errors = fb_result.diagnostics.iter().any(|d| d.level == "error");
 
-                let response = CreateFStarResponse {
+                let mut response = serde_json::to_value(CreateFStarResponse {
                     session_id: session_id.clone(),
                     status: if has_errors {
                         "error".to_string()
@@ -88,9 +117,14 @@ impl ToolHandler for CreateFStarTool {
                     diagnostics: fb_result.diagnostics.iter().map(DiagnosticInfo::from).collect(),
                     fragments: fb_result.fragments.iter().map(FragmentInfo::from).collect(),
                     created_at,
-                };
+                })?;
+                
+                // Add file_path to response if we created a temp file
+                if created_file {
+                    response["file_path"] = json!(file_path.to_string_lossy());
+                }
 
-                Ok(serde_json::to_value(response)?)
+                Ok(response)
             }
             Err(e) => Ok(json!({
                 "session_id": session_id,
@@ -102,21 +136,35 @@ impl ToolHandler for CreateFStarTool {
 
     fn metadata(&self) -> Option<ToolInfo> {
         Some(ToolInfo::new(
-            "create_fstar",
-            Some("Create a new F* session for a file and run initial typecheck. Returns session ID for subsequent operations.".to_string()),
+            "create_session",
+            Some("Create a new F* session. All arguments are optional with sensible defaults.".to_string()),
             json!({
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Path to the F* file to typecheck"
+                        "description": "Path to the F* file. If omitted, creates a temporary .fst file."
                     },
-                    "config_path": {
+                    "fstar_exe": {
                         "type": "string",
-                        "description": "Path to the .fst.config.json configuration file"
+                        "description": "Path to fstar.exe. Defaults to 'fstar.exe' in PATH."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for F*. Defaults to the file's directory."
+                    },
+                    "include_dirs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Include directories (--include paths)."
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "F* command-line options (e.g., ['--cache_dir', '.cache'])."
                     }
                 },
-                "required": ["file_path", "config_path"]
+                "required": []
             }),
         ))
     }
@@ -420,79 +468,6 @@ impl ToolHandler for LookupSymbolTool {
 }
 
 // ============================================================================
-// Tool: autocomplete
-// ============================================================================
-
-pub struct AutocompleteTool;
-
-#[derive(Debug, Deserialize)]
-struct AutocompleteArgs {
-    session_id: String,
-    partial_symbol: String,
-}
-
-#[async_trait]
-impl ToolHandler for AutocompleteTool {
-    async fn handle(&self, args: Value, _extra: pmcp::RequestHandlerExtra) -> pmcp::Result<Value> {
-        let params: AutocompleteArgs = serde_json::from_value(args)
-            .map_err(|e| pmcp::Error::validation(format!("Invalid arguments: {}", e)))?;
-
-        let result = {
-            let mut sessions = SESSION_MANAGER.sessions.write().await;
-            match sessions.get_mut(&params.session_id) {
-                Some(session) => session.process.autocomplete(&params.partial_symbol).await,
-                None => {
-                    return Err(pmcp::Error::validation(format!(
-                        "Session not found: {}",
-                        params.session_id
-                    )));
-                }
-            }
-        };
-
-        match result {
-            Ok(completions) => {
-                let response = AutocompleteResponse {
-                    completions: completions
-                        .into_iter()
-                        .map(|(match_len, annotation, candidate)| CompletionInfo {
-                            match_length: match_len,
-                            annotation,
-                            candidate,
-                        })
-                        .collect(),
-                };
-                Ok(serde_json::to_value(response)?)
-            }
-            Err(e) => Ok(json!({
-                "error": format!("Autocomplete failed: {}", e)
-            })),
-        }
-    }
-
-    fn metadata(&self) -> Option<ToolInfo> {
-        Some(ToolInfo::new(
-            "autocomplete",
-            Some("Get autocomplete suggestions for a partial symbol".to_string()),
-            json!({
-                "type": "object",
-                "properties": {
-                    "session_id": {
-                        "type": "string",
-                        "description": "Session ID from create_fstar"
-                    },
-                    "partial_symbol": {
-                        "type": "string",
-                        "description": "Partial symbol to complete"
-                    }
-                },
-                "required": ["session_id", "partial_symbol"]
-            }),
-        ))
-    }
-}
-
-// ============================================================================
 // Tool: restart_solver
 // ============================================================================
 
@@ -634,122 +609,6 @@ impl ToolHandler for ListSessionsTool {
 }
 
 // ============================================================================
-// Tool: lookup_by_name  
-// ============================================================================
-
-pub struct LookupByNameTool;
-
-#[derive(Debug, Deserialize)]
-struct LookupByNameArgs {
-    session_id: String,
-    name: String,
-}
-
-#[async_trait]
-impl ToolHandler for LookupByNameTool {
-    async fn handle(&self, args: Value, _extra: pmcp::RequestHandlerExtra) -> pmcp::Result<Value> {
-        let params: LookupByNameArgs = serde_json::from_value(args)
-            .map_err(|e| pmcp::Error::validation(format!("Invalid arguments: {}", e)))?;
-
-        // Get the file path from the session
-        let file_path = {
-            let sessions = SESSION_MANAGER.sessions.read().await;
-            match sessions.get(&params.session_id) {
-                Some(session) => session.file_path.to_string_lossy().to_string(),
-                None => {
-                    return Err(pmcp::Error::validation(format!(
-                        "Session not found: {}",
-                        params.session_id
-                    )));
-                }
-            }
-        };
-
-        // Lookup at line 1, column 0 with the given symbol name
-        // This is a simplified lookup that doesn't require position
-        let result = {
-            let mut sessions = SESSION_MANAGER.sessions.write().await;
-            match sessions.get_mut(&params.session_id) {
-                Some(session) => {
-                    session.process
-                        .lookup(&file_path, 1, 0, &params.name)
-                        .await
-                }
-                None => {
-                    return Err(pmcp::Error::validation(format!(
-                        "Session not found: {}",
-                        params.session_id
-                    )));
-                }
-            }
-        };
-
-        match result {
-            Ok(Some(lookup)) => {
-                let response = match lookup {
-                    IdeLookupResponse::Symbol(s) => LookupResponse {
-                        kind: "symbol".to_string(),
-                        name: Some(s.name),
-                        type_info: s.type_info,
-                        documentation: s.documentation,
-                        defined_at: s.defined_at.as_ref().map(RangeInfo::from),
-                    },
-                    IdeLookupResponse::Module(m) => LookupResponse {
-                        kind: "module".to_string(),
-                        name: Some(m.name),
-                        type_info: None,
-                        documentation: None,
-                        defined_at: Some(RangeInfo {
-                            file: m.path,
-                            start_line: 1,
-                            start_column: 0,
-                            end_line: 1,
-                            end_column: 0,
-                        }),
-                    },
-                };
-                Ok(serde_json::to_value(response)?)
-            }
-            Ok(None) => {
-                let response = LookupResponse {
-                    kind: "not_found".to_string(),
-                    name: None,
-                    type_info: None,
-                    documentation: None,
-                    defined_at: None,
-                };
-                Ok(serde_json::to_value(response)?)
-            }
-            Err(e) => Ok(json!({
-                "kind": "error",
-                "error": format!("Lookup failed: {}", e)
-            })),
-        }
-    }
-
-    fn metadata(&self) -> Option<ToolInfo> {
-        Some(ToolInfo::new(
-            "lookup_by_name",
-            Some("Look up a symbol by name in the current scope (simpler than lookup_symbol, doesn't require position)".to_string()),
-            json!({
-                "type": "object",
-                "properties": {
-                    "session_id": {
-                        "type": "string",
-                        "description": "Session ID from create_fstar"
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "The fully qualified name to look up (e.g., 'FStar.List.map')"
-                    }
-                },
-                "required": ["session_id", "name"]
-            }),
-        ))
-    }
-}
-
-// ============================================================================
 // Get Proof Context Tool
 // ============================================================================
 
@@ -810,7 +669,7 @@ impl ToolHandler for GetProofContextTool {
                 "properties": {
                     "session_id": {
                         "type": "string",
-                        "description": "Session ID from create_fstar"
+                        "description": "Session ID from create_session"
                     },
                     "line": {
                         "type": "integer",
@@ -832,13 +691,11 @@ pub fn create_fstar_server() -> Result<Server, Box<dyn std::error::Error>> {
         .name("fstar-mcp")
         .version("0.1.0")
         .capabilities(ServerCapabilities::tools_only())
-        .tool("create_fstar", CreateFStarTool)
+        .tool("create_session", CreateSessionTool)
         .tool("list_sessions", ListSessionsTool)
         .tool("typecheck_buffer", TypecheckBufferTool)
         .tool("update_buffer", UpdateBufferTool)
         .tool("lookup_symbol", LookupSymbolTool)
-        .tool("lookup_by_name", LookupByNameTool)
-        .tool("autocomplete", AutocompleteTool)
         .tool("restart_solver", RestartSolverTool)
         .tool("close_session", CloseSessionTool)
         .tool("get_proof_context", GetProofContextTool)
